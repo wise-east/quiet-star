@@ -1,0 +1,15 @@
+transformers~=4.37.0.dev0
+datasets
+# flash_attn
+# torch @ https://download.pytorch.org/whl/cu121/torch/
+wandb
+accelerate==0.28.0
+matplotlib
+seaborn
+termcolor
+fsspec==2023.5.0
+reportlab
+sentencepiece
+huggingface_hub[cli]
+bitsandbytes==0.47.0
+peft==0.10.*

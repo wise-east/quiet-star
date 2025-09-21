@@ -8,6 +8,7 @@ import time
 import re
 from tqdm import tqdm
 from collections import Counter
+from loguru import logger
 
 import argparse
 parser = argparse.ArgumentParser()
@@ -19,7 +20,6 @@ parser.add_argument("--n_votes", type=int, default=8)
 parser.add_argument("--temp", type=float, default=0.9)
 parser.add_argument("--start_final_answer_idx", type=int, default=384)
 parser.add_argument("--answer_length", type=int, default=12)
-parser.add_argument("--root_prefix", type=str, default="YOUR_ROOT_HERE")
 parser.add_argument("--checkpoint", type=str, default="ezelikman/quietstar-8-ahead")
 parser.add_argument("--final_answer_text", type=str, default="\nTherefore, the answer (arabic numerals) is")
 parser.add_argument("--zero_shot_cot_prompt", type=str, default="\nA: Let's think step by step.")
@@ -45,7 +45,6 @@ def model_init(params):
         args.checkpoint,
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         device_map='auto',
-        cache_dir=args.root_prefix + "cache",
         max_thoughts=n_ahead + n_ahead_talk + 1,
         merged_talk_heads=merged_talk_heads,
         merged_lm_and_talk_heads=False,
@@ -58,7 +57,7 @@ def model_init(params):
         use_weighted_talk_head=True,
     )
     print("Loaded model")
-    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
+    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", use_fast=False)
     tokenizer.padding_side = "right"
     tokenizer.pad_token_id = tokenizer.eos_token_id
     special_tokens_to_add = []
@@ -106,7 +105,7 @@ torch.manual_seed(random_seed)
 random.seed(random_seed)
 
 # Load the GSM8K dataset and the model
-cot_dataset_gsm = load_dataset("gsm8k", "main", split="test", ignore_verifications=True).shuffle(seed=random_seed)
+cot_dataset_gsm = load_dataset("gsm8k", "main", split="test").shuffle(seed=random_seed)
 model = model_init(None)
 
 start_question = args.device_batch_size * args.batch_idx
@@ -119,7 +118,8 @@ for batch_start in tqdm(range(start_question, min(args.max_idx, end_question), b
         print(f"Skipping {batch_start}")
         continue
     extracted_answers = []
-    for vote_idx in range(1, args.n_votes + 1):
+    for vote_idx in tqdm(range(1, args.n_votes + 1)):
+        logger.info(f"Generating answer for {batch_start} to {batch_start + batch_size} with vote {vote_idx}")
         folder_name = f"answers/eval_{'baseline' if args.baseline else 'ft'}_{args.n_ahead if not args.baseline else 1}_{args.temp}_{vote_idx}"
         if not os.path.exists(folder_name):
             os.makedirs(folder_name)
@@ -135,7 +135,9 @@ for batch_start in tqdm(range(start_question, min(args.max_idx, end_question), b
         # Generate the solution
         with torch.no_grad():
             finished_generating = torch.zeros(len(input_ids), dtype=torch.bool, device=input_ids.device)
-            for cur_token_idx in range(args.start_final_answer_idx + args.answer_length):
+            for cur_token_idx in tqdm(range(args.start_final_answer_idx + args.answer_length)):
+                logger.info(f"Generating answer for {batch_start} to {batch_start + batch_size} with vote {vote_idx} at token {cur_token_idx}")
+                
                 # Sample the next token
                 new_ids = model(
                     input_ids[~finished_generating],
@@ -195,6 +197,7 @@ for batch_start in tqdm(range(start_question, min(args.max_idx, end_question), b
                         # We finished generating the answer
                         break
                 
+                # stop generating if we have generated the answer for too long
                 if started_generating_answer_at is not None:
                     if cur_token_idx - started_generating_answer_at > args.answer_length:
                         break

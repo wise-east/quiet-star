@@ -7,3 +7,16 @@ This project is implemented by simply patching the base Mistral implementation i
 One pitfall to be wary of: the model is not taught not to generate start and end thought tokens. Thus, when performing actual inference, it is necessary to mask these out.
 
 We make an 8-thought-token ahead (including start and end tokens) model [available via Huggingface](https://huggingface.co/ezelikman/quietstar-8-ahead).
+
+
+## Setup 
+
+```bash 
+# on gpu machine 
+conda create -n quietstar python=3.11
+conda activate quietstar
+pip install torch 
+pip install -r requirements.txt
+huggingface-cli login # for mistral model
+python quiet-star-train.py
+```

@@ -6,26 +6,36 @@ from accelerate import infer_auto_device_map, init_empty_weights, dispatch_model
 from datasets import load_dataset
 from torch.nn import CrossEntropyLoss
 from transformers import TrainingArguments, Trainer
+from peft import LoraConfig, get_peft_model, TaskType
 import os
 import time
 import wandb
-from huggingface_custom_callback import EarlyStoppingCallback
+from transformers import EarlyStoppingCallback
 from eval_helpers import preprocess_eval_function_gsm, preprocess_eval_function_csqa, preprocess_function, compute_metrics, truncate_or_pad
 random_seed = 42
 torch.manual_seed(random_seed)
 random.seed(random_seed)
 
+from transformers.models.mistral import configuration_mistral as original_configuration_mistral
+from transformers.models.mistral import modeling_mistral as original_modeling_mistral
+import configuration_mistral
+import modeling_mistral
+
+original_modeling_mistral.MistralModel = modeling_mistral.MistralModel
+original_modeling_mistral.MistralForCausalLM = modeling_mistral.MistralForCausalLM
+original_configuration_mistral.MistralConfig = configuration_mistral.MistralConfig
+
 # MAIN SETUP
-root_prefix = "YOUR_CACHE_PATH_HERE"
+root_prefix = "./"
 wandb_cache_dir = root_prefix + "cache/quietstar/wandb_cache"
 dataset_name = 'open-web-math/open-web-math'
 # dataset_name = 'c4'
 project_name = "quiet-star"
 os.environ["WANDB_PROJECT"] = project_name + "-" + dataset_name.split("/")[-1]
 os.environ["WANDB_CACHE_DIR"] = wandb_cache_dir
-n_ahead_talk_global = 4
+n_ahead_talk_global = 2
 n_passes_global = 2
-n_ahead_global = 12
+n_ahead_global = 4
 n_examples = 1_000
 full_batch_size = 8
 eval_and_logging_steps = 10
@@ -56,8 +66,7 @@ def model_init(params):
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map='auto',
-        cache_dir=root_prefix + "cache",
+        # device_map='auto',
         max_thoughts=n_ahead + n_ahead_talk + 1,
         merged_talk_heads=merged_talk_heads,
         merged_lm_and_talk_heads=False,
@@ -70,7 +79,7 @@ def model_init(params):
         use_weighted_talk_head=True,
     )
     print("Loaded model")
-    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
+    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", max_length=128, use_fast=False)
     tokenizer.padding_side = "right"
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -101,6 +110,29 @@ def model_init(params):
     model.run_start = int(time.time())
     model.kill_after = 100
     model.train()
+    # Apply LoRA (PEFT) to reduce trainable parameters and memory footprint
+    lora_config = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        lora_dropout=0.05,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            # "gate_proj",
+            # "up_proj",
+            # "down_proj",
+        ],
+    )
+    model = get_peft_model(model, lora_config)
+    try:
+        model.print_trainable_parameters()
+    except Exception:
+        pass
+    # model.config.use_cache = False 
     return model
 
 # Load dataset
@@ -108,14 +140,12 @@ dataset = load_dataset(
     dataset_name,
     "en" if "c4" in dataset_name else "default",
     split=f"train[:{n_examples}]",
-    ignore_verifications=True,
-    num_proc=16,
-    cache_dir=root_prefix + "cache/datasets/",
+    num_proc=16
 )
 
 train_dataset = dataset.shuffle(seed=random_seed).map(preprocess_function, batched=True, writer_batch_size=200)
-eval_dataset_gsm = load_dataset("gsm8k", "main", split="test", ignore_verifications=True).map(preprocess_eval_function_gsm, batched=True, writer_batch_size=200)
-eval_dataset_csqa = load_dataset("tau/commonsense_qa", "default", split="validation", ignore_verifications=True).map(preprocess_eval_function_csqa, batched=True, writer_batch_size=200)
+eval_dataset_gsm = load_dataset("gsm8k", "main", split="test").map(preprocess_eval_function_gsm, batched=True, writer_batch_size=200)
+eval_dataset_csqa = load_dataset("tau/commonsense_qa", "default", split="validation").map(preprocess_eval_function_csqa, batched=True, writer_batch_size=200)
 
 eval_datasets = {
     "gsm8k": eval_dataset_gsm,
@@ -124,10 +154,14 @@ eval_datasets = {
 
 batch_size = full_batch_size // n_passes_global
 global_gradient_accumulation_steps = full_batch_size // batch_size
+batch_size = 1 
 run_id = int(time.time())
+
 training_args = TrainingArguments(
     output_dir=root_prefix + f"cache/quietstar/{run_id}",
     learning_rate=1e-6,
+    # optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
+    # optim="paged_adamw_8bit",
     optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
     per_device_train_batch_size=batch_size,
     per_device_eval_batch_size=batch_size,
@@ -135,7 +169,7 @@ training_args = TrainingArguments(
     max_grad_norm=1.0,
     max_steps=100000,
     warmup_steps=20,
-    auto_find_batch_size=True,
+    auto_find_batch_size=False,
     weight_decay=0.001,
     label_names=["labels"],
     include_inputs_for_metrics=True,
@@ -144,14 +178,18 @@ training_args = TrainingArguments(
     evaluation_strategy="steps",
     save_steps=save_steps,
     run_name=f"n={n_ahead_global}_nt={n_ahead_talk_global}_np={n_passes_global}",
+    # gradient_checkpointing=True,
+    fp16=True
 )
 
+model = model_init(None)
+
 trainer = Trainer(
+    model=model,
     args=training_args,
     train_dataset=train_dataset,
     eval_dataset=eval_datasets,
     compute_metrics=compute_metrics,
-    model_init=model_init,
 )
 
 trainer.train()

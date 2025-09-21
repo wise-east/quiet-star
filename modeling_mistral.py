@@ -42,12 +42,12 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from ...activations import ACT2FN
-from ...cache_utils import Cache, DynamicCache
-from ...modeling_attn_mask_utils import _prepare_4d_causal_attention_mask, _prepare_4d_causal_attention_mask_for_sdpa
-from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
-from ...modeling_utils import PreTrainedModel
-from ...utils import (
+from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask, _prepare_4d_causal_attention_mask_for_sdpa
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
+from transformers.modeling_utils import PreTrainedModel
+from transformers.utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
     is_flash_attn_2_available,
@@ -55,7 +55,8 @@ from ...utils import (
     logging,
     replace_return_docstrings,
 )
-from .configuration_mistral import MistralConfig
+from configuration_mistral import MistralConfig
+from dataclasses import dataclass
 
 
 if is_flash_attn_2_available():
@@ -1527,15 +1528,21 @@ class MistralForCausalLM(MistralPreTrainedModel):
                     self.end_embedding.data[0] = self.model.embed_tokens.weight.data[base_end_id].clone().detach() / self.embedding_scale
                 self.end_embedding.data[1] = torch.log(self.model.embed_tokens.weight.data.std(dim=0) * self.thought_init_std_scale / self.embedding_scale)
 
+        # start and end thought tokens has two dimensions: [0] is the mean embedding and [1] is the log of the standard deviation scaled by the embedding scale
+        # this is in order to allow for reparameterization of the thought embeddings, which encourages exploration of the embedding space through stochasticity
+        # this can be ignored because reparam is not used in the paper
+
+        # rm_initilized set to true in model_init() of inference_quietstar.py since weights are loaded from the checkpoint. these should be initialized to zero for training from scratch
         if not self.rm_initialized and (self.n_ahead > 1 or not self.base_original_mode):
-            self.rm_initialized = True                        
+            self.rm_initialized = True           
+            # if using the complex talking head,set the final linear layer to all zeros, so that the talk head initially contributes no residual (training starts from base LM behavior)        
             if not self.use_shallow_talk:
                 head = self.talk_head[0]
                 cur_head = head[-1] if isinstance(head, nn.Sequential) else head
                 talk_input_dim = cur_head.weight.data.shape[1]
                 talk_output_dim = 1 if self.use_weighted_talk_head else self.lm_head.weight.data.shape[0]
                 cur_head.weight.data = torch.zeros(talk_output_dim, talk_input_dim, device=cur_head.weight.device, dtype=cur_head.weight.dtype)
-            else:
+            else: # otherwise talk head is transformed to identity transform and inputs go through it unchanged.
                 # convert to identity transform
                 def lambda_transform(cur_head):
                     if cur_head.weight.data.shape[0] != cur_head.weight.data.shape[1]:
@@ -1586,10 +1593,10 @@ class MistralForCausalLM(MistralPreTrainedModel):
         loss_list = []
         dqn_loss_list = []
         sampled_token_history = []
-        sample_probs_history = []
         action_loglikelihoods_list = []
 
         if self.use_end_thought_token or self.use_start_thought_token:
+            # if reparam for thought embeddings is not used, then the thought embeddings are fixed and only the embedding scale is scaled
             if not self.use_reparam_for_thought_embeddings:
                 start_embedding = self.start_embedding[0].unsqueeze(0) * self.embedding_scale
                 end_embedding = self.end_embedding[0].unsqueeze(0) * self.embedding_scale
@@ -1599,6 +1606,9 @@ class MistralForCausalLM(MistralPreTrainedModel):
             base_embeddings = self.model.embed_tokens.weight
             if self.train_only_thinking_embedding:
                 base_embeddings = base_embeddings.detach()
+                
+                
+                
         # # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         fwd_iters = 1 if self.original_mode else self.n_ahead + self.n_ahead_talk - 1
         for ahead_idx in range(fwd_iters):
@@ -1633,11 +1643,14 @@ class MistralForCausalLM(MistralPreTrainedModel):
                         if contains_end:
                             sampled_end = inputs_embeds.clone().detach()
                     else:
+                        ### this part is concerning because it is not clear why the thought embeddings are repeated for each token instead of actually using the input tokens + thought token 
                         inputs_embeds = cur_thought_embedding.unsqueeze(0).repeat(batch_size, seq_len, 1)
                 else:
                     with torch.set_grad_enabled(not self.train_only_thinking_embedding):
                         inputs_embeds = self.model.embed_tokens(input_ids)
             
+            
+            # create the attention mask so that at each token position, the model can only attend to previous tokens
             if self.n_ahead != 1 or self.n_ahead_talk != 1 or self.comparison_mode:
                 if attention_mask is None:
                     base_attention_mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=0).to(input_ids.device)
@@ -1661,10 +1674,11 @@ class MistralForCausalLM(MistralPreTrainedModel):
                         sliding_window=self.config.sliding_window,
                     )
 
+            # go through the model except for the LM head
             outputs = self.model(
                 # input_ids=input_ids,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
+                position_ids=position_ids, # position_ids will broadcast to the same shape as input_ids
                 past_key_values=past_key_values,
                 inputs_embeds=inputs_embeds,
                 use_cache=use_cache,
@@ -1678,6 +1692,7 @@ class MistralForCausalLM(MistralPreTrainedModel):
             prev_rm_logits = rm_logits  # for policy gradient
             prev_rm_tokens = cur_rm_tokens  # for policy gradient
 
+            # at ahead_idx ==0, we are in the base LM mode
             if ahead_idx == 0:
                 hidden_states_lm = hidden_states
                 logits = self.lm_head(hidden_states_lm)
@@ -1689,14 +1704,14 @@ class MistralForCausalLM(MistralPreTrainedModel):
                 if self.optimize_model_only_at_start:
                     hidden_states = hidden_states.detach()
                 base_logits = logits.clone()
-            else:
+            else: # at ahead_idx > 0, we are in the talking head mode
                 talk_hidden_states = hidden_states
                 if self.merged_lm_and_talk_heads:
                     assert self.no_residual
                     residual_logits = self.lm_head(hidden_states)
                     talk_hidden_states = hidden_states
                 else:
-                    if ahead_idx > self.n_ahead - 1:
+                    if ahead_idx > self.n_ahead - 1: # this will never be reached because ahead_idx is always less than n_ahead
                         cur_base_hidden = torch.cat([
                             base_hidden_states[..., ahead_idx - self.n_ahead + 1:, :],
                             base_hidden_states[..., :ahead_idx - self.n_ahead + 1, :]
@@ -1709,6 +1724,7 @@ class MistralForCausalLM(MistralPreTrainedModel):
                         head_input_hidden_states = torch.cat([cur_base_hidden, talk_hidden_states], dim=-1)
                     else:
                         head_input_hidden_states = talk_hidden_states
+
 
                     residual_logits = self.talk_head[0](head_input_hidden_states)
                     if self.use_shallow_talk:
@@ -1801,9 +1817,9 @@ class MistralForCausalLM(MistralPreTrainedModel):
                     
                 # don't allow it to predict the thinking token
                 if self.tokenizer_has_start_thought_token:                    
-                    rm_logits[..., self.start_token_id] = -1e10
+                    rm_logits[..., self.start_token_id] = torch.finfo(rm_logits.dtype).min
                 if self.tokenizer_has_end_thought_token:
-                    rm_logits[..., self.end_token_id] = -1e10
+                    rm_logits[..., self.end_token_id] = torch.finfo(rm_logits.dtype).min
                 probabilities = rm_logits
                 if probabilities_2d is not None:
                     prev_probabilities_2d = probabilities_2d.clone()
@@ -1819,6 +1835,8 @@ class MistralForCausalLM(MistralPreTrainedModel):
                     override_token = self.end_token_id
                 else:
                     override_token = None
+                    
+                # This is where the start token is forced to be the first token
                 if override_token is not None and self.n_ahead > 1:
                     # always start with the start token
                     probabilities_2d = torch.zeros_like(probabilities_2d)
@@ -1851,7 +1869,12 @@ class MistralForCausalLM(MistralPreTrainedModel):
                     probabilities_2d = F.gumbel_softmax(sample_probs, tau=temperature, hard=True, dim=-1)
                     if self.gumbel_detach:
                         probabilities_2d = probabilities_2d.detach()
-                sampled_token_history.append(probabilities_2d.argmax(dim=-1).detach().cpu())
+                        
+                        
+                # Record sampled tokens per step as [batch, seq_len]
+                sampled_step = probabilities_2d.argmax(dim=-1).detach()  # [batch*seq_len]
+                sampled_step = sampled_step.view(batch_size, seq_len).cpu()
+                sampled_token_history.append(sampled_step)
                 # convert rm logits directly to embeddings
                 contains_start = self.use_start_thought_token and (probabilities_2d[..., self.start_token_id].sum() > 0)
                 contains_end = self.use_end_thought_token and (probabilities_2d[..., self.end_token_id].sum() > 0)
@@ -1875,6 +1898,8 @@ class MistralForCausalLM(MistralPreTrainedModel):
                         inputs_embeds = inputs_embeds.view(probabilities.size(0), probabilities.size(1), -1).to(self.model.embed_tokens.weight.dtype)
                 inputs_embeds = inputs_embeds.view(probabilities.size(0), probabilities.size(1), -1).to(self.model.embed_tokens.weight.dtype)
 
+                # create the updated attention mask for the newly created tokens (this is from the paper, Figure 3 that creates the parallel inference mask)
+                # the original attention mask is concatentaed with an identity matrix for the newly created tokens
                 if len(attention_mask.shape) == 2:
                     breakpoint()
                 else:
@@ -1893,11 +1918,14 @@ class MistralForCausalLM(MistralPreTrainedModel):
                                 seq_len, dtype=torch.float32, device=attention_mask.device
                             ).to(attention_mask.dtype)
 
+                        # reshape to be the same as original attention mask 
                         new_attention = new_attention.view(1, 1, seq_len, seq_len).repeat(input_ids.shape[0], 1, 1, 1)
                         new_attention = new_attention * original_attention
                         new_attention[new_attention == 0] = attention_mask.min()
                         new_attention[new_attention == 1] = attention_mask.max()
-                    attention_mask = torch.cat([attention_mask, new_attention], dim=-1)
+                    attention_mask = torch.cat([attention_mask, new_attention], dim=-1) # [batch_size, head_num, seq_len, seq_len*2]
+                # does the new attention mask have to be sized the same as the input_ids? doesn't it just need to be the size of how many tokens are going to be generated as thought tokens?    
+                    
                 past_key_values = outputs.past_key_values
                 position_ids = position_ids + 1
 
@@ -2113,7 +2141,8 @@ class MistralForCausalLM(MistralPreTrainedModel):
 
         if not return_dict:
             output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
+            extra = (sampled_token_history,)
+            return (loss,) + output + extra if loss is not None else output + extra
     
         base_log_dict = {
             f"loss_{i}": nonzero_mean(loss_list[i]) for i in range(len(loss_list))
@@ -2179,12 +2208,22 @@ class MistralForCausalLM(MistralPreTrainedModel):
         if not self.training:
             self.n_ahead_talk = n_ahead_talk_to_restore
             self.n_passes = n_passes_to_restore
-        return CausalLMOutputWithPast(
+        # Stack sampled token history to [thought_length, batch, seq_len] then permute to [batch, thought_length, seq_len]
+        stacked_history = None
+        if len(sampled_token_history) > 0:
+            try:
+                stacked_history = torch.stack([t for t in sampled_token_history], dim=0)  # [S, B, T]
+                stacked_history = stacked_history.permute(1, 0, 2).contiguous()  # [B, S, T]
+            except Exception:
+                stacked_history = None
+
+        return CausalLMOutputWithPastAndSamples(
             loss=loss if loss is not None else None,
             logits=(rm_logits if self.n_ahead > 1 else logits) if not self.output_logits_at_the_end else logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            sampled_token_history=stacked_history,
         )
 
 
@@ -2377,3 +2416,7 @@ class MistralForSequenceClassification(MistralPreTrainedModel):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
+
+@dataclass
+class CausalLMOutputWithPastAndSamples(CausalLMOutputWithPast):
+    sampled_token_history: Optional[List[torch.Tensor]] = None
