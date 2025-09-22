@@ -18,5 +18,11 @@ conda activate quietstar
 pip install torch 
 pip install -r requirements.txt
 huggingface-cli login # for mistral model
-python quiet-star-train.py
+```
+
+
+## Training 
+
+```bash 
+deepspeed --num_gpus=1 quiet-star-train.py
 ```

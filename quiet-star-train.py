@@ -12,6 +12,8 @@ import time
 import wandb
 from transformers import EarlyStoppingCallback
 from eval_helpers import preprocess_eval_function_gsm, preprocess_eval_function_csqa, preprocess_function, compute_metrics, truncate_or_pad
+from argparse import ArgumentParser
+
 random_seed = 42
 torch.manual_seed(random_seed)
 random.seed(random_seed)
@@ -25,6 +27,19 @@ original_modeling_mistral.MistralModel = modeling_mistral.MistralModel
 original_modeling_mistral.MistralForCausalLM = modeling_mistral.MistralForCausalLM
 original_configuration_mistral.MistralConfig = configuration_mistral.MistralConfig
 
+
+parser = ArgumentParser()
+parser.add_argument("--n_ahead", type=int, default=4)
+parser.add_argument("--n_ahead_talk", type=int, default=2)
+parser.add_argument("--n_passes", type=int, default=2)
+parser.add_argument("--n_examples", type=int, default=1_000)
+parser.add_argument("--max_length", type=int, default=16)
+parser.add_argument("--full_batch_size", type=int, default=8)
+parser.add_argument("--eval_and_logging_steps", type=int, default=5)
+parser.add_argument("--save_steps", type=int, default=100)
+parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training via DeepSpeed")
+args = parser.parse_args()
+
 # MAIN SETUP
 root_prefix = "./"
 wandb_cache_dir = root_prefix + "cache/quietstar/wandb_cache"
@@ -33,13 +48,13 @@ dataset_name = 'open-web-math/open-web-math'
 project_name = "quiet-star"
 os.environ["WANDB_PROJECT"] = project_name + "-" + dataset_name.split("/")[-1]
 os.environ["WANDB_CACHE_DIR"] = wandb_cache_dir
-n_ahead_talk_global = 2
-n_passes_global = 2
-n_ahead_global = 4
-n_examples = 1_000
-full_batch_size = 8
-eval_and_logging_steps = 10
-save_steps = 100
+n_ahead_talk_global = args.n_ahead_talk
+n_passes_global = args.n_passes
+n_ahead_global = args.n_ahead
+n_examples = args.n_examples
+full_batch_size = args.full_batch_size
+eval_and_logging_steps = args.eval_and_logging_steps
+save_steps = args.save_steps
 
 def model_init(params):
     original = False
@@ -79,7 +94,7 @@ def model_init(params):
         use_weighted_talk_head=True,
     )
     print("Loaded model")
-    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", max_length=128, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", use_fast=False)
     tokenizer.padding_side = "right"
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -143,9 +158,10 @@ dataset = load_dataset(
     num_proc=16
 )
 
-train_dataset = dataset.shuffle(seed=random_seed).map(preprocess_function, batched=True, writer_batch_size=200)
-eval_dataset_gsm = load_dataset("gsm8k", "main", split="test").map(preprocess_eval_function_gsm, batched=True, writer_batch_size=200)
-eval_dataset_csqa = load_dataset("tau/commonsense_qa", "default", split="validation").map(preprocess_eval_function_csqa, batched=True, writer_batch_size=200)
+max_length = args.max_length
+train_dataset = dataset.shuffle(seed=random_seed).map(preprocess_function, batched=True, writer_batch_size=200, fn_kwargs={"max_length": max_length})
+eval_dataset_gsm = load_dataset("gsm8k", "main", split="test[:10]").map(preprocess_eval_function_gsm, batched=True, writer_batch_size=200, fn_kwargs={"max_length": max_length})
+eval_dataset_csqa = load_dataset("tau/commonsense_qa", "default", split="validation[:10]").map(preprocess_eval_function_csqa, batched=True, writer_batch_size=200, fn_kwargs={"max_length": max_length})
 
 eval_datasets = {
     "gsm8k": eval_dataset_gsm,
@@ -162,9 +178,10 @@ training_args = TrainingArguments(
     learning_rate=1e-6,
     # optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
     # optim="paged_adamw_8bit",
-    optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
-    per_device_train_batch_size=batch_size,
-    per_device_eval_batch_size=batch_size,
+    # optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
+    optim="adamw_torch",
+    per_device_train_batch_size=1,
+    per_device_eval_batch_size=1,
     gradient_accumulation_steps=global_gradient_accumulation_steps,
     max_grad_norm=1.0,
     max_steps=100000,
@@ -179,7 +196,10 @@ training_args = TrainingArguments(
     save_steps=save_steps,
     run_name=f"n={n_ahead_global}_nt={n_ahead_talk_global}_np={n_passes_global}",
     # gradient_checkpointing=True,
-    fp16=True
+    # fp16=True
+    bf16=True,
+    # deepspeed="deepspeed_zero3.json",
+    # use_legacy_prediction_loop=True
 )
 
 model = model_init(None)
