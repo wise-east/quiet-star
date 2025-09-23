@@ -1234,7 +1234,7 @@ class MistralForCausalLM(MistralPreTrainedModel):
         self.loss_mean = loss_mean
         self.all_rewards = []
         self.all_unreduced_losses = []
-        self.kill_after = 100
+        self.kill_after = 1000
 
         self.start_embedding = nn.Parameter(torch.zeros(2, self.model.config.hidden_size))
         self.end_embedding = nn.Parameter(torch.zeros(2, self.model.config.hidden_size))
@@ -1645,8 +1645,6 @@ class MistralForCausalLM(MistralPreTrainedModel):
                         sliding_window=self.config.sliding_window,
                     )
                     
-            breakpoint()
-
             # go through the model except for the LM head
             outputs = self.model(
                 # input_ids=input_ids,
@@ -2138,14 +2136,23 @@ class MistralForCausalLM(MistralPreTrainedModel):
         final_logits = (rm_logits if self.n_ahead > 1 else logits) if not self.output_logits_at_the_end else logits
         final_logits = final_logits.contiguous().to(self.lm_head.weight.device)
 
-        return CausalLMOutputWithPastAndSamples(
+        return CausalLMOutputWithPast(
             loss=loss if loss is not None else None,
             logits=final_logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            sampled_token_history=stacked_history,
         )
+
+        # this is only needed for visualizing the sampled token history
+        # return CausalLMOutputWithPastAndSamples(
+        #     loss=loss if loss is not None else None,
+        #     logits=final_logits,
+        #     past_key_values=outputs.past_key_values,
+        #     hidden_states=outputs.hidden_states,
+        #     attentions=outputs.attentions,
+        #     sampled_token_history=stacked_history,
+        # )
 
 
     def prepare_inputs_for_generation(
@@ -2430,20 +2437,7 @@ class MistralForCausalLM(MistralPreTrainedModel):
             
             # create the attention mask so that at each token position, the model can only attend to previous tokens
             if self.n_ahead != 1 or self.n_ahead_talk != 1 or self.comparison_mode:
-                if attention_mask is None:
-                    base_attention_mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=0).to(input_ids.device)
-                    base_attention_mask = base_attention_mask.view(1, 1, seq_len, seq_len)
-                    base_attention_mask = base_attention_mask.repeat(input_ids.shape[0], 1, 1, 1)
-                    attention_mask = base_attention_mask
-                    breakpoint()
-                elif attention_mask.dim() == 2:
-                    if seq_len + past_key_values_length != attention_mask.shape[-1]:
-                        breakpoint()
-                        attention_mask = torch.cat(
-                            [torch.ones((attention_mask.shape[0], past_key_values_length), dtype=attention_mask.dtype, device=attention_mask.device), attention_mask],
-                            dim=-1
-                        )
-                    # # if the attention mask 
+                if attention_mask is not None and attention_mask.dim() == 2:
                     attention_mask = _prepare_4d_causal_attention_mask(
                         attention_mask,
                         (batch_size, seq_len),
@@ -2999,14 +2993,22 @@ class MistralForCausalLM(MistralPreTrainedModel):
         final_logits = (rm_logits if self.n_ahead > 1 else logits) if not self.output_logits_at_the_end else logits
         final_logits = final_logits.contiguous().to(self.lm_head.weight.device)
 
-        return CausalLMOutputWithPastAndSamples(
+        return CausalLMOutputWithPast(
             loss=loss if loss is not None else None,
             logits=final_logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            sampled_token_history=stacked_history,
         )
+
+        # return CausalLMOutputWithPastAndSamples(
+        #     loss=loss if loss is not None else None,
+        #     logits=final_logits,
+        #     past_key_values=outputs.past_key_values,
+        #     hidden_states=outputs.hidden_states,
+        #     attentions=outputs.attentions,
+        #     sampled_token_history=stacked_history,
+        # )
 
 
 

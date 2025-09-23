@@ -24,5 +24,20 @@ huggingface-cli login # for mistral model
 ## Training 
 
 ```bash 
-deepspeed --num_gpus=1 quiet-star-train.py
+# when just using lora with small n_ahead and n_ahead_talk, runs on a single a40 with 48gb memory
+python quiet-star-train.py --max_length 256 --lora --learning_rate 1e-4 --lora_r 64 --lora_alpha 128 --n_ahead 4 --n_ahead_talk 2
+
+# when using lora with largeer n_ahead and n_ahead_talk, runs on a single a100 with 80gb memory
+python quiet-star-train.py --max_length 128 --lora --learning_rate 1e-4 --lora_r 64 --lora_alpha 128 --n_ahead 8 --n_ahead_talk 4
+```
+
+
+## Testing base 
+```bash 
+python quiet-star-train.py --original --max_length 256 
+```
+
+This should return ~6% accuracy on GSM8K and ~36% accuracy on CSQA, which is in line with the results in the paper.
+```
+Trial evaluation metrics: {'eval_gsm8k_loss': 4.394712924957275, 'eval_gsm8k_accuracy': 0.06264498829841614, 'eval_gsm8k_runtime': 77.9772, 'eval_gsm8k_samples_per_second': 2.565, 'eval_gsm8k_steps_per_second': 2.565, 'eval_csqa_loss': 5.664874076843262, 'eval_csqa_accuracy': 0.36201953887939453, 'eval_csqa_runtime': 14.1808, 'eval_csqa_samples_per_second': 14.104, 'eval_csqa_steps_per_second': 14.104}
 ```

@@ -20,23 +20,24 @@ random.seed(random_seed)
 
 from transformers.models.mistral import configuration_mistral as original_configuration_mistral
 from transformers.models.mistral import modeling_mistral as original_modeling_mistral
-import configuration_mistral
-import modeling_mistral
-
-original_modeling_mistral.MistralModel = modeling_mistral.MistralModel
-original_modeling_mistral.MistralForCausalLM = modeling_mistral.MistralForCausalLM
-original_configuration_mistral.MistralConfig = configuration_mistral.MistralConfig
 
 
 parser = ArgumentParser()
-parser.add_argument("--n_ahead", type=int, default=4)
-parser.add_argument("--n_ahead_talk", type=int, default=2)
+parser.add_argument("--n_ahead", type=int, default=8)
+parser.add_argument("--n_ahead_talk", type=int, default=4)
 parser.add_argument("--n_passes", type=int, default=2)
 parser.add_argument("--n_examples", type=int, default=1_000)
-parser.add_argument("--max_length", type=int, default=16)
+parser.add_argument("--max_length", type=int, default=256)
+parser.add_argument("--per_device_train_batch_size", type=int, default=1)
 parser.add_argument("--full_batch_size", type=int, default=8)
-parser.add_argument("--eval_and_logging_steps", type=int, default=5)
-parser.add_argument("--save_steps", type=int, default=100)
+parser.add_argument("--eval_and_logging_steps", type=int, default=20)
+parser.add_argument("--learning_rate", type=float, default=1e-6)
+parser.add_argument("--original", action="store_true", help="Use original Mistral model instead of Quiet-STaR")
+parser.add_argument("--lora", action="store_true", help="Use LoRA")
+parser.add_argument("--lora_r", type=int, default=8)
+parser.add_argument("--lora_alpha", type=int, default=16)
+parser.add_argument("--lora_dropout", type=float, default=0.05)
+parser.add_argument("--save_steps", type=int, default=10000)
 parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training via DeepSpeed")
 args = parser.parse_args()
 
@@ -52,6 +53,7 @@ n_ahead_talk_global = args.n_ahead_talk
 n_passes_global = args.n_passes
 n_ahead_global = args.n_ahead
 n_examples = args.n_examples
+per_device_train_batch_size = args.per_device_train_batch_size
 full_batch_size = args.full_batch_size
 eval_and_logging_steps = args.eval_and_logging_steps
 save_steps = args.save_steps
@@ -60,8 +62,10 @@ def model_init(params):
     original = False
     if params is None:
         params = {}
-    else:
-        params = params.params
+    else: 
+        # unpack params as dict 
+        params = vars(params)
+
     # save params to file
     n_ahead = params.get("n_ahead", n_ahead_global if not original else 1)
     n_ahead_talk = params.get("n_ahead_talk", n_ahead_talk_global if not original else 1)
@@ -92,6 +96,7 @@ def model_init(params):
         use_complex_think_head=False,
         use_complex_talk_head=True,
         use_weighted_talk_head=True,
+        attn_implementation="sdpa",
     )
     print("Loaded model")
     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", use_fast=False)
@@ -123,31 +128,35 @@ def model_init(params):
     model.original_mode = original
     model.config_params = params
     model.run_start = int(time.time())
-    model.kill_after = 100
+    model.kill_after = 1000
     model.train()
     # Apply LoRA (PEFT) to reduce trainable parameters and memory footprint
-    lora_config = LoraConfig(
-        r=8,
-        lora_alpha=16,
-        lora_dropout=0.05,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            # "gate_proj",
-            # "up_proj",
-            # "down_proj",
-        ],
-    )
-    model = get_peft_model(model, lora_config)
-    try:
-        model.print_trainable_parameters()
-    except Exception:
-        pass
-    # model.config.use_cache = False 
+    if params.get("lora", False):
+        lora_config = LoraConfig(
+            r=params.get("lora_r", 8),
+            lora_alpha=params.get("lora_alpha", 16),
+            lora_dropout=params.get("lora_dropout", 0.05),
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+        )
+        model = get_peft_model(model, lora_config)
+        for n, p in model.named_parameters():
+            if n in ["start_embedding", "end_embedding"] or n.startswith("talk_head"):
+                p.requires_grad = True
+        try:
+            model.print_trainable_parameters()
+        except Exception:
+            pass
+
     return model
 
 # Load dataset
@@ -160,49 +169,75 @@ dataset = load_dataset(
 
 max_length = args.max_length
 train_dataset = dataset.shuffle(seed=random_seed).map(preprocess_function, batched=True, writer_batch_size=200, fn_kwargs={"max_length": max_length})
-eval_dataset_gsm = load_dataset("gsm8k", "main", split="test[:10]").map(preprocess_eval_function_gsm, batched=True, writer_batch_size=200, fn_kwargs={"max_length": max_length})
-eval_dataset_csqa = load_dataset("tau/commonsense_qa", "default", split="validation[:10]").map(preprocess_eval_function_csqa, batched=True, writer_batch_size=200, fn_kwargs={"max_length": max_length})
+eval_dataset_gsm = load_dataset("gsm8k", "main", split="test[:200]").map(preprocess_eval_function_gsm, batched=True, writer_batch_size=200, fn_kwargs={"max_length": max_length})
+eval_dataset_csqa = load_dataset("tau/commonsense_qa", "default", split="validation[:200]").map(preprocess_eval_function_csqa, batched=True, writer_batch_size=200, fn_kwargs={"max_length": max_length})
 
 eval_datasets = {
     "gsm8k": eval_dataset_gsm,
     "csqa": eval_dataset_csqa,
 }
 
-batch_size = full_batch_size // n_passes_global
-global_gradient_accumulation_steps = full_batch_size // batch_size
-batch_size = 1 
+global_gradient_accumulation_steps = full_batch_size // per_device_train_batch_size
 run_id = int(time.time())
 
 training_args = TrainingArguments(
     output_dir=root_prefix + f"cache/quietstar/{run_id}",
-    learning_rate=1e-6,
+    learning_rate=args.learning_rate,
     # optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
     # optim="paged_adamw_8bit",
-    # optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
-    optim="adamw_torch",
-    per_device_train_batch_size=1,
-    per_device_eval_batch_size=1,
+    optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
+    per_device_train_batch_size=per_device_train_batch_size,
+    per_device_eval_batch_size=per_device_train_batch_size,
     gradient_accumulation_steps=global_gradient_accumulation_steps,
     max_grad_norm=1.0,
-    max_steps=100000,
+    max_steps=1000,
     warmup_steps=20,
     auto_find_batch_size=False,
     weight_decay=0.001,
     label_names=["labels"],
     include_inputs_for_metrics=True,
-    logging_steps=eval_and_logging_steps,
+    logging_steps=1,
     eval_steps=eval_and_logging_steps,
     evaluation_strategy="steps",
     save_steps=save_steps,
     run_name=f"n={n_ahead_global}_nt={n_ahead_talk_global}_np={n_passes_global}",
     # gradient_checkpointing=True,
-    # fp16=True
-    bf16=True,
     # deepspeed="deepspeed_zero3.json",
-    # use_legacy_prediction_loop=True
+    bf16=True,
 )
 
-model = model_init(None)
+if args.original:
+    model = AutoModelForCausalLM.from_pretrained(
+        "mistralai/Mistral-7B-v0.1",
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+    )
+
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+    )
+    model = get_peft_model(model, lora_config)
+
+else: 
+    import configuration_mistral
+    import modeling_mistral
+    original_modeling_mistral.MistralModel = modeling_mistral.MistralModel
+    original_modeling_mistral.MistralForCausalLM = modeling_mistral.MistralForCausalLM
+    original_configuration_mistral.MistralConfig = configuration_mistral.MistralConfig
+
+    model = model_init(args)
 
 trainer = Trainer(
     model=model,
@@ -211,5 +246,16 @@ trainer = Trainer(
     eval_dataset=eval_datasets,
     compute_metrics=compute_metrics,
 )
+
+# do a trial evaluation before training to catch issues early
+try:
+    model.eval()
+    print("Running trial evaluation before training...")
+    trial_metrics = trainer.evaluate()
+    print("Trial evaluation metrics:", trial_metrics)
+    model.train()
+except Exception as e:
+    print("Trial evaluation failed:", e)
+    raise
 
 trainer.train()

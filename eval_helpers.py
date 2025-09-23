@@ -1,6 +1,7 @@
 import torch
 import random
 from transformers import AutoTokenizer
+from loguru import logger
 
 initial_tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1", use_fast=False)
 initial_tokenizer.padding_side = "right"
@@ -51,13 +52,15 @@ def preprocess_eval_function_csqa(examples, max_length=256):
 def compute_metrics(eval_pred, filter_numbers=True):
     logits, labels, _ = eval_pred
     accuracy = 0
-    logits = logits[0]
     valid_number_tokens = [28740, 28750, 28770, 28781, 28782, 28784, 28787, 28783, 28774, 28734, 13] # numbers
     valid_letter_tokens = [330, 365, 334, 384, 413, 13] # answer tokens
     for question, logits_guess in zip(labels, logits):
         # find which token corresponds to eval_answer_marker
         # chop off tokens from the end until the number of eval_answer_marker goes down
         detokenized_question = initial_tokenizer.decode(question)
+        if eval_answer_marker not in detokenized_question or detokenized_question.split(eval_answer_marker)[-1].strip() == "":
+            logger.warning(f"Eval answer marker not found or no answer provided after answer marker in question: {detokenized_question}")
+            continue
         is_numeric = detokenized_question.split(eval_answer_marker)[-1][1].isdigit()
         valid_tokens = valid_number_tokens if is_numeric else valid_letter_tokens
         answer_count = detokenized_question.count(eval_answer_marker)
