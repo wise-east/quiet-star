@@ -1,3 +1,4 @@
+#!/bin/sh
 # SBATCH --job-name=quietstar-train
 # SBATCH --output=quietstar-train.out
 # SBATCH --time=12:00:00
